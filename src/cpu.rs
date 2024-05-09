@@ -1,4 +1,5 @@
 use crate::opcodes;
+use crate::rom::Rom;
 
 #[derive(Debug)]
 pub enum AddressingMode {
@@ -14,6 +15,79 @@ pub enum AddressingMode {
     None,
 }
 
+pub trait Memory {
+    fn memory_read(&self, address: u16) -> u8;
+    fn memory_write(&mut self, address: u16, value: u8);
+
+    fn memory_read_u16(&self, address: u16) -> u16 {
+        let low_byte = self.memory_read(address) as u16;
+        let high_byte = self.memory_read(address + 1) as u16;
+        (high_byte << 8) | low_byte
+    }
+
+    fn memory_write_u16(&mut self, address: u16, value: u16) {
+        let low_byte = value as u8;
+        let high_byte = (value >> 8) as u8;
+        self.memory_write(address, low_byte);
+        self.memory_write(address + 1, high_byte);
+    }
+}
+
+#[derive(Debug)]
+pub struct Bus {
+    cpu_ram: [u8; 2048],
+    rom: Rom,
+}
+
+impl Bus {
+    pub fn new(rom: Rom) -> Self {
+        Bus {
+            cpu_ram: [0; 2048],
+            rom,
+        }
+    }
+
+    pub fn read_prg_rom(&self, mut address: u16) -> u8 {
+        address -= 0x8000;
+        if self.rom.prg.len() == 0x4000 && address >= 0x4000 {
+            address %= 0x4000;
+        }
+
+        self.rom.prg[address as usize]
+    }
+}
+
+impl Memory for Bus {
+    fn memory_read(&self, address: u16) -> u8 {
+        match address {
+            0x0000..=0x1fff => self.cpu_ram[(address & 0x07ff) as usize],
+            0x2000..=0x3fff => {
+                todo!("PPU registers");
+            }
+            0x8000..=0xffff => self.read_prg_rom(address),
+            _ => {
+                println!("ignoring read from address {:#06x}", address);
+                0
+            }
+        }
+    }
+
+    fn memory_write(&mut self, address: u16, value: u8) {
+        match address {
+            0x0000..=0x1fff => self.cpu_ram[(address & 0x07ff) as usize] = value,
+            0x2000..=0x3fff => {
+                todo!("PPU registers");
+            }
+            0x8000..=0xffff => {
+                panic!("Cannot write to ROM");
+            }
+            _ => {
+                println!("ignoring write to address {:#06x}", address);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::upper_case_acronyms)]
 pub struct CPU {
@@ -24,11 +98,21 @@ pub struct CPU {
     pub index_register_x: u8,
     pub index_register_y: u8,
 
-    memory: [u8; 0xffff],
+    pub bus: Bus,
+}
+
+impl Memory for CPU {
+    fn memory_read(&self, address: u16) -> u8 {
+        self.bus.memory_read(address)
+    }
+
+    fn memory_write(&mut self, address: u16, value: u8) {
+        self.bus.memory_write(address, value);
+    }
 }
 
 impl CPU {
-    pub fn new() -> Self {
+    pub fn new(bus: Bus) -> Self {
         CPU {
             program_counter: 0,
             stack_pointer: 0xfd,
@@ -36,35 +120,15 @@ impl CPU {
             accumulator: 0,
             index_register_x: 0,
             index_register_y: 0,
-            memory: [0; 0xffff],
+            bus,
         }
     }
 
-    pub fn memory_read(&self, address: u16) -> u8 {
-        self.memory[address as usize]
-    }
-
-    pub fn memory_read_u16(&self, address: u16) -> u16 {
-        let low_byte = self.memory_read(address) as u16;
-        let high_byte = self.memory_read(address + 1) as u16;
-        (high_byte << 8) | low_byte
-    }
-
-    pub fn memory_write(&mut self, address: u16, value: u8) {
-        self.memory[address as usize] = value;
-    }
-
-    pub fn memory_write_u16(&mut self, address: u16, value: u16) {
-        let low_byte = value as u8;
-        let high_byte = (value >> 8) as u8;
-        self.memory_write(address, low_byte);
-        self.memory_write(address + 1, high_byte);
-    }
-
     pub fn load_program(&mut self, address: u16, program: Vec<u8>) {
-        let address_usize = address as usize;
-        self.memory[address_usize..(address_usize + program.len())].copy_from_slice(&program[..]);
-        self.memory_write_u16(0xfffc, address);
+        for (i, byte) in program.iter().enumerate() {
+            self.memory_write(address + i as u16, *byte);
+        }
+        // self.memory_write_u16(0xfffc, address | 0x8000);
     }
 
     pub fn reset(&mut self) {
@@ -77,12 +141,54 @@ impl CPU {
     }
 
     pub fn load_and_run(&mut self, program: Vec<u8>) {
-        self.load_program(0x8000, program);
+        self.load_program(0x0600, program);
         self.reset();
+        self.program_counter = 0x0600;
         self.run();
     }
 
-    fn get_operand_address(&self, mode: &AddressingMode) -> u16 {
+    pub fn get_operand_address_pc(&self, mode: &AddressingMode, program_counter: u16) -> u16 {
+        match mode {
+            AddressingMode::Immediate => program_counter,
+            AddressingMode::ZeroPage => self.memory_read(program_counter) as u16,
+            AddressingMode::ZeroPageX => {
+                let pos = self.memory_read(program_counter);
+                pos.wrapping_add(self.index_register_x) as u16
+            }
+            AddressingMode::ZeroPageY => {
+                let pos = self.memory_read(program_counter);
+                pos.wrapping_add(self.index_register_y) as u16
+            }
+            AddressingMode::Absolute => self.memory_read_u16(program_counter),
+            AddressingMode::AbsoluteX => {
+                let base = self.memory_read_u16(program_counter);
+                base.wrapping_add(self.index_register_x as u16)
+            }
+            AddressingMode::AbsoluteY => {
+                let base = self.memory_read_u16(program_counter);
+                base.wrapping_add(self.index_register_y as u16)
+            }
+            AddressingMode::IndirectX => {
+                let base = self.memory_read(program_counter);
+                let ptr: u8 = base.wrapping_add(self.index_register_x);
+                let lo = self.memory_read(ptr as u16);
+                let hi = self.memory_read(ptr.wrapping_add(1) as u16);
+                (hi as u16) << 8 | (lo as u16)
+            }
+            AddressingMode::IndirectY => {
+                let base = self.memory_read(program_counter);
+                let lo = self.memory_read(base as u16);
+                let hi = self.memory_read(base.wrapping_add(1) as u16);
+                let deref_base = (hi as u16) << 8 | (lo as u16);
+                deref_base.wrapping_add(self.index_register_y as u16)
+            }
+            AddressingMode::None => {
+                panic!("Invalid addressing mode");
+            }
+        }
+    }
+
+    pub fn get_operand_address(&self, mode: &AddressingMode) -> u16 {
         match mode {
             AddressingMode::Immediate => self.program_counter,
             AddressingMode::ZeroPage => self.memory_read(self.program_counter) as u16,
@@ -455,12 +561,6 @@ impl CPU {
         self.program_counter = self.pop_u16();
     }
 
-    fn jump(&mut self, mode: &AddressingMode) {
-        let address = self.get_operand_address(mode);
-        let target = self.memory_read_u16(address);
-        self.program_counter = target;
-    }
-
     fn jump_subroutine(&mut self) {
         let target = self.get_operand_address(&AddressingMode::Absolute);
         let return_address = self.program_counter + 1;
@@ -538,264 +638,218 @@ impl CPU {
             let opcode = opcodes_map.get(&code).unwrap();
             match code {
                 0x00 => {
-                    println!("BRK");
                     // self.force_interrupt();
                     break;
                 }
                 0x69 | 0x65 | 0x75 | 0x6d | 0x7d | 0x79 | 0x61 | 0x71 => {
-                    println!("ADC, {:?}", opcode.mode);
                     self.add_with_carry(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x29 | 0x25 | 0x35 | 0x2d | 0x3d | 0x39 | 0x21 | 0x31 => {
-                    println!("AND, {:?}", opcode.mode);
                     self.and(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x0a => {
-                    println!("ASL A");
                     self.arithmetic_shift_left_a();
                 }
                 0x06 | 0x16 | 0x0e | 0x1e => {
-                    println!("ASL, {:?}", opcode.mode);
                     self.arithmetic_shift_left_m(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x90 => {
-                    println!("BCC");
                     self.branch(0b0000_0001, 0b0000_0000);
                 }
                 0xb0 => {
-                    println!("BCS");
                     self.branch(0b0000_0001, 0b0000_0001);
                 }
                 0xf0 => {
-                    println!("BEQ");
                     self.branch(0b0000_0010, 0b0000_0010);
                 }
                 0x24 | 0x2c => {
-                    println!("BIT, {:?}", opcode.mode);
                     self.bit_test(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x30 => {
-                    println!("BMI");
                     self.branch(0b1000_0000, 0b1000_0000);
                 }
                 0xd0 => {
-                    println!("BNE");
                     self.branch(0b0000_0010, 0b0000_0000);
                 }
                 0x10 => {
-                    println!("BPL");
                     self.branch(0b1000_0000, 0b0000_0000);
                 }
                 0x50 => {
-                    println!("BVC");
                     self.branch(0b0100_0000, 0b0000_0000);
                 }
                 0x70 => {
-                    println!("BVS");
                     self.branch(0b0100_0000, 0b0100_0000);
                 }
                 0x18 => {
-                    println!("CLC");
                     self.update_carry_flag(false);
                 }
                 0xd8 => {
-                    println!("CLD");
                     self.update_decimal_mode_flag(false);
                 }
                 0x58 => {
-                    println!("CLI");
                     self.update_interrupt_disable_flag(false);
                 }
                 0xb8 => {
-                    println!("CLV");
                     self.update_overflow_flag(false);
                 }
                 0xc9 | 0xc5 | 0xd5 | 0xcd | 0xdd | 0xd9 | 0xc1 | 0xd1 => {
-                    println!("CMP, {:?}", opcode.mode);
                     self.compare_a(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xe0 | 0xe4 | 0xec => {
-                    println!("CPX, {:?}", opcode.mode);
                     self.compare_x(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xc0 | 0xc4 | 0xcc => {
-                    println!("CPY, {:?}", opcode.mode);
                     self.compare_y(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xc6 | 0xd6 | 0xce | 0xde => {
-                    println!("DEC, {:?}", opcode.mode);
                     self.decrement_m(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xca => {
-                    println!("DEX");
                     self.decrement_x();
                 }
                 0x88 => {
-                    println!("DEY");
                     self.decrement_y();
                 }
                 0x49 | 0x45 | 0x55 | 0x4d | 0x5d | 0x59 | 0x41 | 0x51 => {
-                    println!("EOR, {:?}", opcode.mode);
                     self.xor(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xe6 | 0xf6 | 0xee | 0xfe => {
-                    println!("INC, {:?}", opcode.mode);
                     self.increment_m(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xe8 => {
-                    println!("INX");
                     self.increment_x();
                 }
                 0xc8 => {
-                    println!("INY");
                     self.increment_y();
                 }
-                0x4c | 0x6c => {
-                    println!("JMP, {:?}", opcode.mode);
-                    self.jump(&opcode.mode);
+                0x4c => {
+                    let address = self.memory_read_u16(self.program_counter);
+                    self.program_counter = address;
+                }
+                0x6c => {
+                    let memory_address = self.memory_read_u16(self.program_counter);
+                    // 6502 bug with page boundary
+                    let address = if memory_address & 0x00ff == 0x00ff {
+                        let lo = self.memory_read(memory_address);
+                        let hi = self.memory_read(memory_address & 0xff00);
+                        (hi as u16) << 8 | (lo as u16)
+                    } else {
+                        self.memory_read_u16(memory_address)
+                    };
+                    self.program_counter = address;
                 }
                 0x20 => {
-                    println!("JSR");
                     self.jump_subroutine();
                 }
                 0xa9 | 0xa5 | 0xb5 | 0xad | 0xbd | 0xb9 | 0xa1 | 0xb1 => {
-                    println!("LDA, {:?}", opcode.mode);
                     self.load_a(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xa2 | 0xa6 | 0xb6 | 0xae | 0xbe => {
-                    println!("LDX, {:?}", opcode.mode);
                     self.load_x(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xa0 | 0xa4 | 0xb4 | 0xac | 0xbc => {
-                    println!("LDY, {:?}", opcode.mode);
                     self.load_y(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x4a => {
-                    println!("LSR A");
                     self.logic_shift_right_a();
                 }
                 0x46 | 0x56 | 0x4e | 0x5e => {
-                    println!("LSR, {:?}", opcode.mode);
                     self.logic_shift_right_m(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xea => {}
                 0x09 | 0x05 | 0x15 | 0x0d | 0x1d | 0x19 | 0x01 | 0x11 => {
-                    println!("ORA, {:?}", opcode.mode);
                     self.or(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x48 => {
-                    println!("PHA");
                     self.push(self.accumulator);
                 }
                 0x08 => {
-                    println!("PHP");
                     self.push(self.status_register);
                 }
                 0x68 => {
-                    println!("PLA");
                     self.pull_a();
                 }
                 0x28 => {
-                    println!("PLP");
                     self.pull_status_register();
                 }
                 0x2a => {
-                    println!("ROL A");
                     self.rotate_left_a();
                 }
                 0x26 | 0x36 | 0x2e | 0x3e => {
-                    println!("ROL, {:?}", opcode.mode);
                     self.rotate_left_m(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x6a => {
-                    println!("ROR A");
                     self.rotate_right_a();
                 }
                 0x66 | 0x76 | 0x6e | 0x7e => {
-                    println!("ROR, {:?}", opcode.mode);
                     self.rotate_right_m(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x40 => {
-                    println!("RTI");
                     self.pull_status_register();
                     self.pull_program_counter();
                 }
                 0x60 => {
-                    println!("RTS");
                     self.pull_program_counter();
                     self.program_counter += 1;
                 }
                 0xe9 | 0xe5 | 0xf5 | 0xed | 0xfd | 0xf9 | 0xe1 | 0xf1 => {
-                    println!("SBC, {:?}", opcode.mode);
                     self.sub_with_carry(&opcode.mode);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x38 => {
-                    println!("SEC");
                     self.update_carry_flag(true);
                 }
                 0xf8 => {
-                    println!("SED");
                     self.update_decimal_mode_flag(true);
                 }
                 0x78 => {
-                    println!("SEI");
                     self.update_interrupt_disable_flag(true);
                 }
                 0x85 | 0x95 | 0x8d | 0x9d | 0x99 | 0x81 | 0x91 => {
-                    println!("STA, {:?}", opcode.mode);
                     self.store(&opcode.mode, self.accumulator);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x86 | 0x96 | 0x8e => {
-                    println!("STX, {:?}", opcode.mode);
                     self.store(&opcode.mode, self.index_register_x);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0x84 | 0x94 | 0x8c => {
-                    println!("STY, {:?}", opcode.mode);
                     self.store(&opcode.mode, self.index_register_y);
                     self.program_counter += (opcode.bytes - 1) as u16;
                 }
                 0xaa => {
-                    println!("TAX");
                     self.transfer_x(self.accumulator);
                 }
                 0xa8 => {
-                    println!("TAY");
                     self.transfer_y(self.accumulator);
                 }
                 0xba => {
-                    println!("TSX");
                     self.transfer_x(self.stack_pointer);
                 }
                 0x8a => {
-                    println!("TXA");
                     self.transfer_a(self.index_register_x);
                 }
                 0x9a => {
-                    println!("TXS");
                     self.load_sp(self.index_register_x);
                 }
                 0x98 => {
-                    println!("TYA");
                     self.transfer_a(self.index_register_y);
                 }
                 _ => {
@@ -813,14 +867,17 @@ impl CPU {
 
 #[cfg(test)]
 mod tests {
+    use crate::rom::test::test_rom;
+
     use super::*;
 
     #[test]
     fn test_add_with_carry_immediate() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x01;
-        cpu.load_program(0x8000, vec![0x69, 0x01, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x69, 0x01, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.accumulator, 0x02);
         assert_eq!(cpu.status_register & 0b0000_0001, 0b0000_0000);
@@ -828,11 +885,12 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_immediate_with_carry() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x01;
         cpu.update_carry_flag(true);
-        cpu.load_program(0x8000, vec![0x69, 0x01, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x69, 0x01, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.accumulator, 0x03);
         assert_eq!(cpu.status_register & 0b0000_0001, 0b0000_0000);
@@ -840,10 +898,11 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_carry_flag() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0xff;
-        cpu.load_program(0x8000, vec![0x69, 0x01, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x69, 0x01, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.accumulator, 0x00);
         assert_eq!(cpu.status_register & 0b0000_0001, 0b0000_0001);
@@ -852,10 +911,11 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_overflow_flag() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x7f;
-        cpu.load_program(0x8000, vec![0x69, 0x01, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x69, 0x01, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.accumulator, 0x80);
         assert_eq!(cpu.status_register & 0b0100_0000, 0b0100_0000);
@@ -864,11 +924,12 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_zero_page() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x01;
         cpu.memory_write(0x0000, 0x01);
-        cpu.load_program(0x8000, vec![0x65, 0x00, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x65, 0x00, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.memory_read(0x0000), 0x01);
         assert_eq!(cpu.accumulator, 0x02);
@@ -876,12 +937,13 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_zero_page_x() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x01;
         cpu.memory_write(0x007f, 0x01);
         cpu.index_register_x = 0xff;
-        cpu.load_program(0x8000, vec![0x75, 0x80, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x75, 0x80, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.memory_read(0x007f), 0x01);
         assert_eq!(cpu.accumulator, 0x02);
@@ -889,11 +951,12 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_absolute() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x01;
         cpu.memory_write(0x0200, 0x01);
-        cpu.load_program(0x8000, vec![0x6d, 0x00, 0x02, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x6d, 0x00, 0x02, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.memory_read(0x0200), 0x01);
         assert_eq!(cpu.accumulator, 0x02);
@@ -901,13 +964,14 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_indirect_x() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x01;
         cpu.memory_write_u16(0x0010, 0x0200);
         cpu.memory_write(0x0200, 0x01);
         cpu.index_register_x = 0x00;
-        cpu.load_program(0x8000, vec![0x61, 0x10, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x61, 0x10, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.memory_read(0x0200), 0x01);
         assert_eq!(cpu.accumulator, 0x02);
@@ -915,13 +979,14 @@ mod tests {
 
     #[test]
     fn test_add_with_carry_indirect_y() {
-        let mut cpu = CPU::new();
+        let bus = Bus::new(test_rom());
+        let mut cpu = CPU::new(bus);
         cpu.accumulator = 0x01;
         cpu.index_register_y = 0x00;
         cpu.memory_write_u16(0x0010, 0x0200);
         cpu.memory_write(0x0200, 0x01);
-        cpu.load_program(0x8000, vec![0x71, 0x10, 0x00]);
-        cpu.program_counter = cpu.memory_read_u16(0xfffc);
+        cpu.load_program(0x0600, vec![0x71, 0x10, 0x00]);
+        cpu.program_counter = 0x0600;
         cpu.run();
         assert_eq!(cpu.memory_read(0x0200), 0x01);
         assert_eq!(cpu.accumulator, 0x02);
